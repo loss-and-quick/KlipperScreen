@@ -6,7 +6,14 @@ import gi
 gi.require_version("Gtk", "3.0")
 from gi.repository import Gtk, GLib, Pango
 from ks_includes.screen_panel import ScreenPanel
-from ks_includes.sdbus_nm import SdbusNm
+try:
+    from ks_includes.sdbus_nm import SdbusNm
+except ImportError:
+    SdbusNm = None
+try:
+    from ks_includes.dbus_iwd import IwdNm
+except ImportError:
+    IwdNm = None
 from datetime import datetime
 
 
@@ -17,33 +24,62 @@ class Panel(ScreenPanel):
         super().__init__(screen, title)
         self.last_drop_time = datetime.now()
         self.show_add = False
-        try:
-            self.sdbus_nm = SdbusNm(self.popup_callback)
-        except Exception as e:
-            logging.exception("Failed to initialize")
-            self.sdbus_nm = None
-            self.error_box = Gtk.Box(
-                orientation=Gtk.Orientation.VERTICAL,
-                hexpand=True,
-                vexpand=True
-            )
-            message = (
-                _("Failed to initialize") + "\n"
-                + "This panel needs NetworkManager installed into the system\n"
-                + "And the appropriate permissions, without them it will not function.\n"
-                + f"\n{e}\n"
-            )
-            self.error_box.add(
-                Gtk.Label(
-                    label=message,
-                    wrap=True,
-                    wrap_mode=Pango.WrapMode.WORD_CHAR,
+        if SdbusNm:
+            try:
+                self.nm = SdbusNm(self.popup_callback)
+            except Exception as e:
+                logging.exception("Failed to initialize")
+                self.nm = None
+                self.error_box = Gtk.Box(
+                    orientation=Gtk.Orientation.VERTICAL,
+                    hexpand=True,
+                    vexpand=True
                 )
-            )
-            self.error_box.set_valign(Gtk.Align.CENTER)
-            self.content.add(self.error_box)
-            self._screen.panels_reinit.append(self._screen._cur_panels[-1])
-            return
+                message = (
+                    _("Failed to initialize") + "\n"
+                    + "This panel needs NetworkManager installed into the system\n"
+                    + "And the apropriate permissions, without them it will not function.\n"
+                    + f"\n{e}\n"
+                )
+                self.error_box.add(
+                    Gtk.Label(
+                        label=message,
+                        wrap=True,
+                        wrap_mode=Pango.WrapMode.WORD_CHAR,
+                    )
+                )
+                self.error_box.set_valign(Gtk.Align.CENTER)
+                self.content.add(self.error_box)
+                self._screen.panels_reinit.append(self._screen._cur_panels[-1])
+                return
+        if IwdNm:
+            try:
+                self.nm = IwdNm(self.popup_callback)
+            except Exception as e:
+                logging.exception("Failed to initialize")
+                self.nm = None
+                self.error_box = Gtk.Box(
+                    orientation=Gtk.Orientation.VERTICAL,
+                    hexpand=True,
+                    vexpand=True
+                )
+                message = (
+                    _("Failed to initialize") + "\n"
+                    + "This panel needs iwd and dbus installed into the system\n"
+                    + "And the apropriate permissions, without them it will not function.\n"
+                    + f"\n{e}\n"
+                )
+                self.error_box.add(
+                    Gtk.Label(
+                        label=message,
+                        wrap=True,
+                        wrap_mode=Pango.WrapMode.WORD_CHAR,
+                    )
+                )
+                self.error_box.set_valign(Gtk.Align.CENTER)
+                self.content.add(self.error_box)
+                self._screen.panels_reinit.append(self._screen._cur_panels[-1])
+                return
         self.update_timeout = None
         self.network_list = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, hexpand=True, vexpand=True)
         self.network_rows = {}
@@ -55,20 +91,20 @@ class Panel(ScreenPanel):
             'weak': self._gtk.PixbufFromIcon('wifi_weak'),
         }
 
-        self.network_interfaces = self.sdbus_nm.get_interfaces()
+        self.network_interfaces = self.nm.get_interfaces()
         logging.info(f"Network interfaces: {self.network_interfaces}")
 
-        self.wireless_interfaces = [iface.interface for iface in self.sdbus_nm.get_wireless_interfaces()]
+        self.wireless_interfaces = [iface.interface for iface in self.nm.get_wireless_interfaces()]
         logging.info(f"Wireless interfaces: {self.wireless_interfaces}")
 
-        self.interface = self.sdbus_nm.get_primary_interface()
+        self.interface = self.nm.get_primary_interface()
         logging.info(f"Primary interface: {self.interface}")
 
         self.labels['interface'] = Gtk.Label(hexpand=True)
         self.labels['ip'] = Gtk.Label(hexpand=True)
         if self.interface is not None:
             self.labels['interface'].set_text(_("Interface") + f': {self.interface}')
-            self.labels['ip'].set_text(f"IP: {self.sdbus_nm.get_ip_address()}")
+            self.labels['ip'].set_text(f"IP: {self.nm.get_ip_address()}")
 
         self.reload_button = self._gtk.Button("refresh", None, "color1", self.bts)
         self.reload_button.set_no_show_all(True)
@@ -79,7 +115,7 @@ class Panel(ScreenPanel):
         self.wifi_toggle = Gtk.Switch(
             width_request=round(self._gtk.font_size * 2),
             height_request=round(self._gtk.font_size),
-            active=self.sdbus_nm.is_wifi_enabled()
+            active=self.nm.is_wifi_enabled()
         )
         self.wifi_toggle.connect("notify::active", self.toggle_wifi)
 
@@ -92,12 +128,12 @@ class Panel(ScreenPanel):
         scroll = self._gtk.ScrolledWindow()
         self.labels['main_box'] = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, vexpand=True)
 
-        if self.sdbus_nm.wifi:
+        if self.nm.wifi:
             self.labels['main_box'].pack_start(sbox, False, False, 5)
             GLib.idle_add(self.load_networks)
             scroll.add(self.network_list)
-            self.sdbus_nm.enable_monitoring(True)
-            self.conn_status = GLib.timeout_add_seconds(1, self.sdbus_nm.monitor_connection_status)
+            self.nm.enable_monitoring(True)
+            self.conn_status = GLib.timeout_add_seconds(1, self.nm.monitor_connection_status)
         else:
             self._screen.show_popup_message(_("No wireless interface has been found"), level=2)
             self.labels['networkinfo'] = Gtk.Label()
@@ -111,7 +147,7 @@ class Panel(ScreenPanel):
         self._screen.show_popup_message(msg, level)
 
     def load_networks(self):
-        for net in self.sdbus_nm.get_networks():
+        for net in self.nm.get_networks():
             self.add_network(net['BSSID'])
         GLib.timeout_add_seconds(10, self._gtk.Button_busy, self.reload_button, False)
         self.content.show_all()
@@ -121,7 +157,7 @@ class Panel(ScreenPanel):
         if bssid in self.network_rows:
             return
 
-        net = next(net for net in self.sdbus_nm.get_networks() if bssid == net['BSSID'])
+        net = next(net for net in self.nm.get_networks() if bssid == net['BSSID'])
         ssid = net['SSID']
 
         connect = self._gtk.Button("load", None, "color3", self.bts)
@@ -137,7 +173,7 @@ class Panel(ScreenPanel):
         buttons = Gtk.Box(spacing=5)
 
         name = Gtk.Label(hexpand=True, halign=Gtk.Align.START, wrap=True, wrap_mode=Pango.WrapMode.WORD_CHAR)
-        if bssid == self.sdbus_nm.get_connected_bssid():
+        if bssid == self.nm.get_connected_bssid():
             ssid += ' (' + _("Connected") + ')'
             name.set_markup(f"<big><b>{ssid}</b></big>")
         else:
@@ -178,7 +214,7 @@ class Panel(ScreenPanel):
             {"name": _("Forget"), "response": Gtk.ResponseType.OK, "style": 'dialog-warning'},
             {"name": _("Cancel"), "response": Gtk.ResponseType.CANCEL, "style": 'dialog-error'},
         ]
-        if bssid == self.sdbus_nm.get_connected_bssid():
+        if bssid == self.nm.get_connected_bssid():
             buttons.insert(0, {"name": _("Disconnect"), "response": Gtk.ResponseType.APPLY, "style": 'dialog-info'})
         self._gtk.Dialog(_("Remove network"), buttons, label, self.confirm_removal, ssid)
 
@@ -186,14 +222,14 @@ class Panel(ScreenPanel):
         self._gtk.remove_dialog(dialog)
         if response_id == Gtk.ResponseType.CANCEL:
             return
-        bssid = self.sdbus_nm.get_bssid_from_ssid(ssid)
+        bssid = self.nm.get_bssid_from_ssid(ssid)
         self.remove_network_from_list(bssid)
         if response_id == Gtk.ResponseType.OK:
             logging.info(f"Deleting {ssid}")
-            self.sdbus_nm.delete_network(ssid)
+            self.nm.delete_network(ssid)
         if response_id == Gtk.ResponseType.APPLY:
             logging.info(f"Disconnecting {ssid}")
-            self.sdbus_nm.disconnect_network()
+            self.nm.disconnect_network()
 
     def add_new_network(self, widget, ssid):
         self._screen.remove_keyboard()
@@ -203,7 +239,7 @@ class Panel(ScreenPanel):
         phase2 = self.get_dropdown_value(self.labels['network_phase2'])
         logging.debug(f"{phase2=}")
         logging.debug(f"{eap_method=}")
-        result = self.sdbus_nm.add_network(ssid, psk, eap_method, identity, phase2)
+        result = self.nm.add_network(ssid, psk, eap_method, identity, phase2)
         if "error" in result:
             self._screen.show_popup_message(result["message"])
             if result["error"] == "psk_invalid":
@@ -239,21 +275,21 @@ class Panel(ScreenPanel):
 
     def connect_network(self, widget, ssid, showadd=True):
         self.deactivate()
-        if showadd and not self.sdbus_nm.is_known(ssid):
-            sec_type = self.sdbus_nm.get_security_type(ssid)
+        if showadd and not self.nm.is_known(ssid):
+            sec_type = self.nm.get_security_type(ssid)
             if sec_type == "Open" or "OWE" in sec_type:
                 logging.debug("Network is Open do not show psk")
-                result = self.sdbus_nm.add_network(ssid, '')
+                result = self.nm.add_network(ssid, '')
                 if "error" in result:
                     self._screen.show_popup_message(result["message"])
             else:
                 self.show_add_network(widget, ssid)
             self.activate()
             return
-        bssid = self.sdbus_nm.get_bssid_from_ssid(ssid)
+        bssid = self.nm.get_bssid_from_ssid(ssid)
         if bssid and bssid in self.network_rows:
             self.remove_network_from_list(bssid)
-        self.sdbus_nm.connect(ssid)
+        self.nm.connect(ssid)
         self.reload_networks()
 
     def remove_network_from_list(self, bssid):
@@ -326,7 +362,7 @@ class Panel(ScreenPanel):
         auth_grid.attach(self.labels['network_psk'], 1, 1, 1, 1)
         auth_grid.attach(save, 2, 0, 1, 2)
 
-        if "802.1x" in self.sdbus_nm.get_security_type(ssid):
+        if "802.1x" in self.nm.get_security_type(ssid):
             user_label.show()
             self.labels['network_eap_method'].show()
             self.labels['network_phase2'].show()
@@ -348,10 +384,10 @@ class Panel(ScreenPanel):
         self.show_add = True
 
     def update_all_networks(self):
-        self.interface = self.sdbus_nm.get_primary_interface()
+        self.interface = self.nm.get_primary_interface()
         self.labels['interface'].set_text(_("Interface") + f': {self.interface}')
-        self.labels['ip'].set_text(f"IP: {self.sdbus_nm.get_ip_address()}")
-        nets = self.sdbus_nm.get_networks()
+        self.labels['ip'].set_text(f"IP: {self.nm.get_ip_address()}")
+        nets = self.nm.get_networks()
         remove = [bssid for bssid in self.network_rows.keys() if bssid not in [net['BSSID'] for net in nets]]
         for bssid in remove:
             self.remove_network_from_list(bssid)
@@ -399,7 +435,7 @@ class Panel(ScreenPanel):
         self.labels['networkinfo'].set_markup(
             f'<b>{self.interface}</b>\n\n'
             + '<b>' + _("Hostname") + f':</b> {os.uname().nodename}\n'
-            f'<b>IPv4:</b> {self.sdbus_nm.get_ip_address()}\n'
+            f'<b>IPv4:</b> {self.nm.get_ip_address()}\n'
         )
         self.labels['networkinfo'].show_all()
         return True
@@ -410,21 +446,21 @@ class Panel(ScreenPanel):
         self.network_rows = {}
         for child in self.network_list.get_children():
             self.network_list.remove(child)
-        if self.sdbus_nm is not None and self.sdbus_nm.wifi:
+        if self.nm is not None and self.nm.wifi:
             if widget:
                 self._gtk.Button_busy(widget, True)
-            self.sdbus_nm.rescan()
+            self.nm.rescan()
             self.load_networks()
         self.activate()
 
     def activate(self):
-        if self.sdbus_nm is None:
+        if self.nm is None:
             return
         if self.update_timeout is None:
-            if self.sdbus_nm.wifi:
+            if self.nm.wifi:
                 if self.reload_button.get_sensitive():
                     self._gtk.Button_busy(self.reload_button, True)
-                    self.sdbus_nm.rescan()
+                    self.nm.rescan()
                     self.load_networks()
                 self.update_all_networks()
                 self.update_timeout = GLib.timeout_add_seconds(5, self.update_all_networks)
@@ -433,18 +469,18 @@ class Panel(ScreenPanel):
                 self.update_timeout = GLib.timeout_add_seconds(5, self.update_single_network_info)
 
     def deactivate(self):
-        if self.sdbus_nm is None:
+        if self.nm is None:
             return
         if self.update_timeout is not None:
             GLib.source_remove(self.update_timeout)
             self.update_timeout = None
-        if self.sdbus_nm.wifi:
-            self.sdbus_nm.enable_monitoring(False)
+        if self.nm.wifi:
+            self.nm.enable_monitoring(False)
 
     def toggle_wifi(self, switch, gparams):
         enable = switch.get_active()
         logging.info(f"WiFi {enable}")
-        self.sdbus_nm.toggle_wifi(enable)
+        self.nm.toggle_wifi(enable)
         if enable:
             self.reload_button.show()
             self.reload_networks()

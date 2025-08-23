@@ -1,0 +1,694 @@
+import logging
+import socket
+import time
+from gi.repository import Gio, GLib, GObject
+from typing import Dict, List, Optional, Callable
+
+# NOTE: This global variable is used to store data
+# because if you simply move the dictionary inside the IwdAgent class as a field,
+# for some reason, the dictionary remains empty during do_handle_method_call,
+# even though values are added to it just fine elsewhere.
+# Therefore, for now, a global dictionary is used.
+# TODO: Incapsulate dict in the IWD agent
+_global_credentials_store = {}
+
+def WifiChannels(freq: str):
+    if freq == "2484":
+        return "2.4", "14"
+    try:
+        f = float(freq)
+    except ValueError:
+        return "?", "?"
+    if 2412 <= f <= 2472:
+        return "2.4", str(int((f - 2407) / 5))
+    if 3657.5 <= f <= 3692.5:
+        return "3", str(int((f - 3000) / 5))
+    if 4915 <= f <= 4980 or 5035 <= f <= 5885:
+        return "5", str(int((f - (4000 if f < 5000 else 5000)) / 5))
+    if 6455 <= f <= 7115:
+        return "6", str(int((f - 5950) / 5))
+    return "?", "?"
+
+
+def get_encryption_from_iwd(type_str: str) -> str:
+    mapping = {
+        'open': 'Open',
+        'psk': 'WPA-PSK',
+        'sae': 'WPA3-SAE',
+        'owe': 'OWE',
+        '8021x': '802.1x',
+        'wep': 'WEP',
+    }
+    for key, val in mapping.items():
+        if key in type_str.lower():
+            return val
+    return type_str.capitalize()
+
+
+class IwdAgent(GObject.Object):
+
+    def __init__(self, iwd_manager=None):
+        super().__init__()
+        
+        self.iwd_manager = iwd_manager
+
+    def do_handle_method_call(self, conn, sender, obj_path, iface, method, params, invocation):
+        try:
+            if method == "RequestPassphrase":
+                self._handle_passphrase_request(params, invocation)
+            elif method == "RequestPrivateKeyPassphrase":
+                self._handle_passphrase_request(params, invocation)
+            elif method == "RequestUserNameAndPassword":
+                self._handle_passphrase_request(params, invocation)
+            elif method == "Cancel":
+                self._handle_cancel(params, invocation)
+            elif method == "Release":
+                self._handle_release(invocation)
+            else:
+                logging.warning(f"Unknown method: {method}")
+                invocation.return_error_literal(
+                    Gio.dbus_error_quark(),
+                    Gio.DBusError.UNKNOWN_METHOD,
+                    f"Unknown method: {method}"
+                )
+        except Exception as e:
+            logging.exception(f"Error in {method}: {e}")
+            invocation.return_error_literal(
+                Gio.dbus_error_quark(),
+                Gio.DBusError.FAILED,
+                str(e)
+            )
+
+    def _handle_passphrase_request(self, params, invocation):
+        net_path = params.unpack()[0]
+        ssid = self._get_network_ssid(net_path)
+        
+        logging.info(f"Passphrase requested for: {ssid}")
+        if ssid and ssid in _global_credentials_store:
+            password = _global_credentials_store[ssid]
+            logging.info(f"Using stored password for {ssid}")
+        else:
+            invocation.return_dbus_error(
+                "net.connman.iwd.Agent.Error.Canceled",
+                "Password request cancelled"
+            )
+            return
+        
+        invocation.return_value(GLib.Variant("(s)", (password,)))
+        logging.info(f"Password provided for {ssid}")
+
+
+    def _handle_cancel(self, params, invocation):
+        reason = params.unpack()[0]
+        logging.info(f"Request cancelled: {reason}")
+        invocation.return_value(None)
+
+    def _handle_release(self, invocation):
+        logging.info("Agent released")
+        invocation.return_value(None)
+
+    def _get_network_ssid(self, net_path: str) -> Optional[str]:
+        if not self.iwd_manager:
+            return None
+            
+        try:
+            net_obj = self.iwd_manager.objects.get(net_path, {})
+            net_props = net_obj.get('net.connman.iwd.Network', {})
+            return net_props.get('Name')
+        except Exception as e:
+            logging.debug(f"Could not get SSID for {net_path}: {e}")
+            return None
+
+    def store_credentials(self, ssid: str, password: str):
+        _global_credentials_store[ssid] = password
+
+    def clear_credentials(self, ssid: str = None):
+        if ssid:
+            _global_credentials_store.pop(ssid, None)
+        else:
+            _global_credentials_store.clear()
+
+    @staticmethod
+    def get_node_info(iface: str = "net.connman.iwd.Agent"):
+        return Gio.DBusNodeInfo.new_for_xml(f"""
+        <node>
+          <interface name="{iface}">
+            <method name="RequestPassphrase">
+              <arg type="o" name="network" direction="in"/>
+              <arg type="s" name="passphrase" direction="out"/>
+            </method>
+            <method name="RequestPrivateKeyPassphrase">
+              <arg type="o" name="network" direction="in"/>
+              <arg type="s" name="passphrase" direction="out"/>
+            </method>
+            <method name="RequestUserPassword">
+              <arg type="o" name="network" direction="in"/>
+              <arg type="s" name="user" direction="in"/>
+              <arg type="s" name="password" direction="out"/>
+            </method>
+            <method name="Cancel">
+              <arg type="s" name="reason" direction="in"/>
+            </method>
+            <method name="Release"/>
+          </interface>
+        </node>
+        """)
+
+class IwdNm:
+    def __init__(self, popup_callback: Callable, adapter_path: str = None):
+        self.popup = popup_callback
+        self.bus = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
+        
+        self.manager = self._create_proxy('/', 'org.freedesktop.DBus.ObjectManager')
+        
+        self.objects = self.manager.GetManagedObjects()
+        self.manager.connect('g-signal', self._on_object_manager_signal)
+        
+        self.agent = IwdAgent(self)
+        self.agent_path = "/klipperscreen/iwd_agent"
+        
+        self._register_agent()
+        
+        self.device_path = self._find_device_path(adapter_path)
+        self.wifi = bool(self.device_path)
+        
+        if self.wifi:
+            self._setup_station_monitor()
+        
+        self.wifi_state = None
+        self.monitor_connection = False
+        self._connection_in_progress = False
+        self.prev_nets = []
+
+    def __del__(self):
+        try:
+            self._unregister_agent()
+        except:
+            pass
+
+    def _create_proxy(self, path: str, interface: str) -> Gio.DBusProxy:
+        return Gio.DBusProxy.new_sync(
+            self.bus,
+            Gio.DBusProxyFlags.NONE,
+            None,
+            "net.connman.iwd",
+            path,
+            interface,
+            None
+        )
+
+    def _find_device_path(self, preferred_path: str = None) -> Optional[str]:
+        if preferred_path and preferred_path in self.objects:
+            if 'net.connman.iwd.Device' in self.objects[preferred_path]:
+                return preferred_path
+        
+        for path, interfaces in self.objects.items():
+            device_iface = interfaces.get('net.connman.iwd.Device')
+            if device_iface and device_iface.get('Mode') == 'station':
+                return path
+        
+        return None
+
+    def _register_agent(self):
+        try:
+            self.bus.register_object(
+                self.agent_path, 
+                self.agent.get_node_info().interfaces[0], 
+                self.agent.do_handle_method_call
+            )
+
+            agent_manager = self._create_proxy('/net/connman/iwd', 'net.connman.iwd.AgentManager')
+            
+            agent_manager.call_sync(
+                "RegisterAgent",
+                GLib.Variant("(o)", (self.agent_path,)),
+                Gio.DBusCallFlags.NONE,
+                -1,
+                None
+            )
+            logging.info("Agent registered successfully")
+            
+        except Exception as e:
+            logging.exception(f"Failed to register agent: {e}")
+
+    def _unregister_agent(self):
+        try:
+            agent_manager = self._create_proxy('/', 'net.connman.iwd.AgentManager')
+            
+            agent_manager.call_sync(
+                "UnregisterAgent",
+                GLib.Variant("(o)", (self.agent_path,)),
+                Gio.DBusCallFlags.NONE,
+                -1,
+                None
+            )
+            logging.info("Agent unregistered")
+            
+        except Exception as e:
+            logging.exception(f"Failed to unregister agent: {e}")
+
+    def _on_object_manager_signal(self, proxy, sender_name, signal_name, params):
+        if signal_name in ('InterfacesAdded', 'InterfacesRemoved'):
+            self.objects = self.manager.GetManagedObjects()
+            
+            if signal_name == 'InterfacesAdded':
+                self._handle_interfaces_added(params)
+            
+            if not self.device_path or self.device_path not in self.objects:
+                new_path = self._find_device_path()
+                if new_path != self.device_path:
+                    self.device_path = new_path
+                    if self.device_path:
+                        self._setup_station_monitor()
+
+    def _handle_interfaces_added(self, params):
+        try:
+            path, interfaces = params.unpack()
+            
+            if 'net.connman.iwd.KnownNetwork' in interfaces:
+                known_network_props = interfaces['net.connman.iwd.KnownNetwork']
+                ssid = known_network_props.get('Name')
+                self.set_known_network_auto_connect(ssid)
+                    
+        except Exception as e:
+            logging.exception(f"Error handling interfaces added: {e}")
+
+    def set_known_network_auto_connect(self, ssid: str, auto_connect: bool = True):
+        try:
+            path = self.get_connection_path_by_ssid(ssid)
+            if path:
+                self._set_auto_connect(path, auto_connect)
+            else:
+                logging.warning(f"Known network path not found for SSID: {ssid}")
+        except Exception as e:
+            logging.exception(f"Error setting AutoConnect for {ssid}: {e}")
+
+    def _setup_station_monitor(self):
+        if not self.wifi or not self.device_path:
+            return
+            
+        try:
+            self.station = self._get_proxy('Station')
+            if self.station:
+                self.station.connect('g-properties-changed', self._on_station_properties_changed)
+                
+                try:
+                    state_variant = self.station.get_cached_property('State')
+                    if state_variant:
+                        self.wifi_state = state_variant.unpack()
+                        logging.info(f"Initial state: {self.wifi_state}")
+                except Exception as e:
+                    logging.debug(f"Could not get initial state: {e}")
+                    
+        except Exception as e:
+            logging.exception(f"Failed to setup station monitor: {e}")
+
+    def _on_station_properties_changed(self, proxy, changed_properties, invalidated_properties):
+        changed = changed_properties.unpack()
+        
+        if 'State' in changed:
+            new_state = changed['State']
+            if new_state != self.wifi_state:
+                self._handle_state_change(self.wifi_state, new_state)
+                self.wifi_state = new_state
+
+    def _handle_state_change(self, old_state: str, new_state: str):
+        if old_state is None:
+            return
+            
+        logging.debug(f"State changed: {new_state}")
+        
+        if new_state == 'connecting':
+            self.popup(_("Connecting"), 1)
+            self._connection_in_progress = True
+            
+        elif new_state == 'connected':
+            self.popup(_("Network connected"), 1)
+            self._connection_in_progress = False
+            
+        elif new_state in ('disconnecting', 'disconnected'):
+            if self._connection_in_progress:
+                self.popup(_("Connection failed"))
+            elif old_state == 'connected':
+                self.popup(_("Network disconnected"))
+                
+            self._connection_in_progress = False
+
+    def get_networks(self) -> List[Dict]:
+        if not self.station or not self.is_wifi_enabled():
+            self.prev_nets = []
+            return []
+
+        try:
+            result = self.station.call_sync(
+                "GetOrderedNetworks",
+                None,
+                Gio.DBusCallFlags.NONE,
+                10000,
+                None
+            )
+            
+            networks_data = result.unpack()[0]
+            
+        except Exception as e:
+            logging.exception(f"Failed to get networks: {e}")
+            return self.prev_nets
+
+        for net_path, signal_strength in networks_data:
+            try:
+                network_info = self._build_network_info(net_path, signal_strength)
+                if network_info and not any(n.get('BSSID') == network_info.get('BSSID') for n in self.prev_nets):
+                    self.prev_nets.append(network_info)
+            except Exception as e:
+                logging.exception(f"Error processing network {net_path}: {e}")
+        connected_bssid = self.get_connected_bssid()
+        if connected_bssid:
+            self.prev_nets = sorted(
+                    self.prev_nets,
+                    key=lambda x: (x['BSSID'] != connected_bssid, -(x['signal_level'] or 0))
+                )
+        else:
+            self.prev_nets = sorted(
+                self.prev_nets,
+                key=lambda x: -x['signal_level'],
+            )
+        return self.prev_nets
+
+    def _build_network_info(self, net_path: str, signal_strength: int) -> Optional[Dict]:
+        try:
+            net_obj = self.objects.get(net_path, {})
+            net_props = net_obj.get('net.connman.iwd.Network', {})
+            
+            if not net_props:
+                return None
+                
+            ssid = net_props.get('Name', '')
+            if not ssid:
+                return None
+                
+            security_type = net_props.get('Type', 'open')
+            security = get_encryption_from_iwd(security_type)
+            known = self.is_known(ssid) or self._get_connected_network_ssid() == ssid
+            
+            bssid = self._get_bss_info(net_path)
+            
+            signal_pct = max(min(2 * (signal_strength / 100 + 100), 100), 0)
+            
+            
+            return {
+                'SSID': ssid,
+                'known': known,
+                'security': security,
+                'frequency': 0,
+                'channel': '?',
+                'band': '?',
+                'signal_level': int(signal_pct),
+                'signal_rssi': signal_strength // 100,
+                'max_bitrate': 0,
+                'BSSID': bssid,
+                'network_path': net_path
+            }
+            
+        except Exception as e:
+            logging.exception(f"Error building network info for {net_path}: {e}")
+            return None
+
+    def _get_bss_info(self, net_path: str) -> tuple:
+        try:
+            network_proxy = self._create_proxy(net_path, "net.connman.iwd.Network")
+            
+            bssid = None
+            
+            for path, interfaces in self.objects.items():
+                bss_iface = interfaces.get('net.connman.iwd.BasicServiceSet')
+                if bss_iface and net_path in path:
+                    bssid = bss_iface.get('Address')
+                    break
+            
+            return bssid
+            
+        except Exception as e:
+            logging.debug(f"Could not get BSS info for {net_path}: {e}")
+            return None, None
+
+    def add_network(self, ssid, psk, eap_method, identity="", phase2=None) -> Dict:
+        try:
+            networks = self.get_networks()
+            target_network = None
+            
+            for net in networks:
+                if net['SSID'] == ssid:
+                    target_network = net
+                    break
+            
+            if not target_network:
+                return {
+                    'error': 'network_not_found',
+                    'message': f'Network "{ssid}" not found'
+                }
+            
+            net_path = target_network['network_path']
+            security = target_network['security']
+            
+            if psk and security not in ['Open', 'OWE']:
+                self.agent.store_credentials(ssid, psk)
+            
+            result = self._connect_to_network(net_path)
+            
+            if result:
+                return {'status': 'connecting', 'message': f'Connecting to "{ssid}"'}
+            else:
+                if psk:
+                    self.agent.clear_credentials(ssid)
+                return {'error': 'connect_failed', 'message': 'Failed to connect'}
+                
+        except Exception as e:
+            logging.exception(f"Exception in add_network: {e}")
+            return {'error': 'exception', 'message': str(e)}
+
+    def _connect_to_network(self, net_path: str) -> bool:
+        try:
+            network_proxy = self._create_proxy(net_path, "net.connman.iwd.Network")
+            
+            network_proxy.call(
+                "Connect",
+                None,
+                Gio.DBusCallFlags.NONE,
+                -1,
+                None,
+            )
+            
+            logging.info(f"Connection initiated to {net_path}")
+            return True
+            
+        except Exception as e:
+            logging.exception(f"Failed to connect to {net_path}: {e}")
+            return False
+
+    def connect(self, ssid: str) -> bool:
+        networks = self.get_networks()
+        for net in networks:
+            if net['SSID'] == ssid:
+                self.popup(f"{ssid}\n{_('Starting WiFi Association')}", 1)
+                return self._connect_to_network(net['network_path'])
+        return False
+
+    def disconnect_network(self) -> bool:
+        try:
+            if not self.station:
+                return False
+                
+            self.station.call_sync(
+                "Disconnect",
+                None,
+                Gio.DBusCallFlags.NONE,
+                10000,
+                None
+            )
+            
+            return True
+            
+        except Exception as e:
+            logging.exception(f"Failed to disconnect: {e}")
+            return False
+
+    def rescan(self):
+        try:
+            if not self.station:
+                return
+                
+            self.station.call_sync(
+                "Scan",
+                None,
+                Gio.DBusCallFlags.NONE,
+                -1,
+                None
+            )
+            
+            self.prev_nets = []
+            
+        except GLib.Error as e:
+            if "InProgress" in str(e) or "Busy" in str(e):
+                logging.info("Scan already in progress")
+            else:
+                self.popup(f"Unexpected error: {e}")
+
+    def is_wifi_enabled(self) -> bool:
+        for interfaces in self.objects.values():
+            adapter = interfaces.get('net.connman.iwd.Adapter')
+            if adapter:
+                return bool(adapter.get('Powered', False))
+        return False
+
+    def toggle_wifi(self, enable: bool) -> bool:
+        try:
+            props_proxy = self._create_proxy(self.device_path, "org.freedesktop.DBus.Properties")
+            props_proxy.call_sync(
+                "Set",
+                GLib.Variant("(ssv)", ('net.connman.iwd.Device', 'Powered', GLib.Variant('b', enable))),
+                Gio.DBusCallFlags.NONE, -1, None
+            )
+            return True
+        except Exception as e:
+            logging.exception(f"Failed to toggle WiFi: {e}")
+            return False
+
+    def get_known_networks(self) -> List[Dict]:
+        known = []
+        for path, interfaces in self.objects.items():
+            kn = interfaces.get('net.connman.iwd.KnownNetwork')
+            if kn and kn.get('Name'):
+                known.append({
+                    'SSID': kn['Name'],
+                    'UUID': path
+                })
+        return known
+
+    def is_known(self, ssid: str) -> bool:
+        return any(n['SSID'] == ssid for n in self.get_known_networks())
+
+    def get_connection_path_by_ssid(self, ssid: str) -> Optional[str]:
+        for n in self.get_known_networks():
+            if n['SSID'] == ssid:
+                return n['UUID']
+        return None
+
+    def delete_network(self, ssid: str):
+        path = self.get_connection_path_by_ssid(ssid)
+        if path:
+            connected_ssid = self._get_connected_network_ssid()
+            is_connected_to_this_network = (connected_ssid == ssid)
+            
+            if is_connected_to_this_network:
+                logging.warning(f"Cannot delete network '{ssid}' - currently connected to it. Disconnect first.")
+                return False
+            self.delete_connection_path(path)
+            self.agent.clear_credentials(ssid)
+
+    def delete_connection_path(self, path: str):
+        try:
+            known_network = self._create_proxy(path, 'net.connman.iwd.KnownNetwork')
+            known_network.call_sync(
+                "Forget",
+                None,
+                Gio.DBusCallFlags.NONE,
+                -1,
+                None
+            )
+            logging.info(f"Forgot network: {path}")
+        except Exception as e:
+            logging.exception(f"Failed to forget network {path}: {e}")
+
+    def get_interfaces(self) -> List[str]:
+        names = []
+        for interfaces in self.objects.values():
+            dev = interfaces.get('net.connman.iwd.Device')
+            if dev and dev.get('Name'):
+                names.append(dev['Name'])
+        return names
+
+    def get_primary_interface(self) -> Optional[str]:
+        interfaces = self.get_interfaces()
+        return interfaces[0] if interfaces else None
+
+    def get_ip_address(self) -> str:
+        iface = self.get_primary_interface()
+        if not iface:
+            return '?'
+        try:
+            import fcntl
+            import struct
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            data = fcntl.ioctl(
+                s.fileno(), 0x8915,
+                struct.pack('256s', iface.encode())
+            )
+            return socket.inet_ntoa(data[20:24])
+        except Exception:
+            return '?'
+
+    def get_connected_bssid(self) -> Optional[str]:
+        try:
+            if not self.station:
+                return None
+                
+            cap_variant = self.station.get_cached_property("ConnectedAccessPoint")
+            if not cap_variant:
+                return None
+            
+            bss_path = cap_variant.unpack()
+            bss_obj = self.objects.get(bss_path, {})
+            bss_props = bss_obj.get('net.connman.iwd.BasicServiceSet', {})
+            
+            return bss_props.get('Address')
+            
+        except Exception as e:
+            logging.exception(f"Failed to get connected BSSID: {e}")
+            return None
+
+    def _get_connected_network_ssid(self) -> Optional[str]:
+        try:
+            if not self.station:
+                return None
+                
+            cn_variant = self.station.get_cached_property('ConnectedNetwork')
+            if not cn_variant:
+                return None
+            
+            net_path = cn_variant.unpack()
+            net_obj = self.objects.get(net_path, {})
+            net_props = net_obj.get('net.connman.iwd.Network', {})
+            
+            return net_props.get('Name')
+            
+        except Exception as e:
+            logging.debug(f"Could not get connected SSID: {e}")
+            return None
+
+    class DeviceWrapper:
+        def __init__(self, interface): 
+            self.interface = interface
+
+    def get_wireless_interfaces(self) -> List:
+        return [self.DeviceWrapper(i) for i in self.get_interfaces()]
+
+    def monitor_connection_status(self) -> bool:
+        return self.monitor_connection
+
+    def enable_monitoring(self, enable: bool):
+        self.monitor_connection = enable
+
+    def get_security_type(self, ssid: str) -> Optional[str]:
+        for net in self.get_networks():
+            if net['SSID'] == ssid:
+                return net['security']
+        return None
+
+    def get_bssid_from_ssid(self, ssid: str) -> Optional[str]:
+        for net in self.get_networks():
+            if net['SSID'] == ssid:
+                return net['BSSID']
+        return None
+
+    def _get_proxy(self, interface: str) -> Gio.DBusProxy:
+        return self._create_proxy(self.device_path, f"net.connman.iwd.{interface}")
